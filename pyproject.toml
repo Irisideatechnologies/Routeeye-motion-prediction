@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vehicle-motion-prediction"
+version = "0.1.0"
+description = "UI-only predictive smoothing layer for vehicle GPS tracking"
+readme = "README.md"
+requires-python = ">=3.9"
+authors = [
+  { name = "Route Eye Team" }
+]
+license = { text = "Proprietary" }
+
+dependencies = []
+
+[tool.setuptools]
+packages = ["motion_prediction"]
+
+[tool.setuptools.package-dir]
+"" = "."
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

@@ -1,0 +1,8 @@
+pytest
+numpy
+flask
+requests
+flask-cors
+websockets
+flask-socketio
+psutil
