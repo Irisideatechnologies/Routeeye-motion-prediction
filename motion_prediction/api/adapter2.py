@@ -12,9 +12,9 @@ class MotionPredictionAdapter:
         self._engine = PredictiveEngine(enabled=enabled)
         self._avg_speed_mps: Optional[float] = None  # System-provided avg speed
 
-    # -----------------------------
+    
     # Feature toggle
-    # -----------------------------
+    
 
     def enable(self) -> None:
         self._engine.set_enabled(True)
@@ -22,17 +22,17 @@ class MotionPredictionAdapter:
     def disable(self) -> None:
         self._engine.set_enabled(False)
 
-    # -----------------------------
+    
     # System avg speed setter
-    # -----------------------------
+    
 
     def set_avg_speed(self, avg_speed_kmph: float) -> None:
 
         self._avg_speed_mps = avg_speed_kmph / 3.6
 
-    # -----------------------------
+    
     # GPS ingestion
-    # -----------------------------
+    
 
     def ingest_gps_packet(
             self,
@@ -91,9 +91,9 @@ class MotionPredictionAdapter:
         if packet.is_valid():
             self._engine.ingest_gps(packet)
 
-    # -----------------------------
-    # NEW: Route context management
-    # -----------------------------
+    
+    # Route context management
+    
 
     def update_route_context(
             self,
@@ -104,9 +104,9 @@ class MotionPredictionAdapter:
 
         self._engine.update_route_context(device_id, route_polyline, stops)
 
-    # -----------------------------
-    # UI-facing query (UNCHANGED)
-    # -----------------------------
+    
+    # UI-facing query 
+    
 
     def get_display_position(
             self,
