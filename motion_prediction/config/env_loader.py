@@ -5,7 +5,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # Extract variables safely
-REDIS_URL = os.environ.get("REDIS_URL", "redis://localhost:6379")
+REDIS_URL = os.environ.get("REDIS_URL", "")
 API_ROUTES_URL = os.environ.get("API_ROUTES_URL", "")
 API_BEARER_TOKEN = os.environ.get("API_BEARER_TOKEN", "")
 TOPIC_PREDICTED_OUT = os.environ.get("TOPIC_PREDICTED_OUT", "gps:predicted")
