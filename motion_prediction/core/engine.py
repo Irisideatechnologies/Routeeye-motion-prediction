@@ -20,7 +20,7 @@ class PredictiveEngine:
         self._enabled = enabled
 
     # -----------------------------
-    # GPS ingestion (UNCHANGED)
+    # GPS ingestion 
     # -----------------------------
 
     def ingest_gps(self, packet: GPSPacket) -> None:
@@ -38,7 +38,7 @@ class PredictiveEngine:
         predictor.ingest_gps(packet)
 
     # -----------------------------
-    # NEW: Route context management
+    # Route context management
     # -----------------------------
 
     def update_route_context(
@@ -57,7 +57,7 @@ class PredictiveEngine:
         predictor.update_route_context(route_polyline, stops)
 
     # -----------------------------
-    # UI output (UNCHANGED)
+    # UI output 
     # -----------------------------
 
     def get_display_position(

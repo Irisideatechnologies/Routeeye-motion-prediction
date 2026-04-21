@@ -1,18 +1,25 @@
+import os
 import time
 import json
+import logging
 import threading
 import queue
 from typing import Dict, Set
 
 import redis
 import requests
+from dotenv import load_dotenv
 
 from motion_prediction.api.adapter2 import MotionPredictionAdapter
 
-REDIS_URL = "----------"
-API_ROUTES_URL = "----------"
-API_BEARER_TOKEN = "----------"
-TOPIC_PREDICTED_OUT = "gps:predicted"
+logger = logging.getLogger(__name__)
+
+load_dotenv()
+
+REDIS_URL = os.environ["REDIS_URL"]
+API_ROUTES_URL = os.environ["API_ROUTES_URL"]
+API_BEARER_TOKEN = os.environ["API_BEARER_TOKEN"]
+TOPIC_PREDICTED_OUT = os.environ.get("TOPIC_PREDICTED_OUT", "gps:predicted")
 
 route_queues: Dict[str, queue.Queue] = {}
 device_to_route: Dict[str, str] = {}
@@ -22,10 +29,7 @@ adapter = MotionPredictionAdapter(enabled=True)
 
 
 def fetch_route_device_mappings() -> dict:
-    """Fetch all routes with vehicles from the backend API.
-    Returns {route_id: {"devices": set, "route_data": dict}}.
-    Deduplicates devices — first route wins if a device appears on multiple routes.
-    """
+    
     headers = {"Authorization": f"Bearer {API_BEARER_TOKEN}"}
 
     resp = requests.get(API_ROUTES_URL, headers=headers, timeout=30)
@@ -51,7 +55,7 @@ def fetch_route_device_mappings() -> dict:
                 active_devices.add(device_id)
                 seen_devices.add(device_id)
             elif device_id and device_id in seen_devices:
-                print(f"[WARN] Device '{device_id}' duplicate on route '{route_id}', skipping.")
+                logger.warning("Device '%s' duplicate on route '%s', skipping.", device_id, route_id)
 
         if active_devices:
             mappings[route_id] = {
@@ -63,23 +67,22 @@ def fetch_route_device_mappings() -> dict:
 
 
 def _process_gps_on_route_thread(device_id: str, payload_str: str) -> None:
-    """Parse and ingest a raw GPS packet. Runs on route thread, no lock needed."""
-    try:
-        data = json.loads(payload_str)
-        adapter.ingest_gps_packet(
-            device_id=device_id,
-            latitude=str(data.get("lat")) if data.get("lat") is not None else "0",
-            longitude=str(data.get("lon")) if data.get("lon") is not None else "0",
-            timestamp=int(data.get("timestamp", time.time() * 1000)),
-            speed=str(data["speed"]) if data.get("speed") is not None else None,
-        )
-    except Exception as e:
-        print(f"[ERROR] GPS processing failed for {device_id}: {e}")
+    """Parse and ingest a raw GPS packet. Runs on route thread, no lock needed.
+
+    """
+    data = json.loads(payload_str)
+    adapter.ingest_gps_packet(
+        device_id=device_id,
+        latitude=str(data.get("lat")) if data.get("lat") is not None else "0",
+        longitude=str(data.get("lon")) if data.get("lon") is not None else "0",
+        timestamp=int(data.get("timestamp", time.time() * 1000)),
+        speed=str(data["speed"]) if data.get("speed") is not None else None,
+    )
 
 
 def route_thread_worker(route_id: str, device_ids: Set[str],
                         route_data: dict, r_pub: redis.Redis) -> None:
-    """Dedicated thread for one route. Drains GPS queue, polls predictions at ~4Hz."""
+    """Dedicated thread for one route. Drains GPS queue, polls predictions exactly at 1Hz (1s)."""
     work_queue = route_queues[route_id]
 
     # Devices added here only after their first GPS arrives (avoids premature timeout)
@@ -95,7 +98,7 @@ def route_thread_worker(route_id: str, device_ids: Set[str],
         if c.get("latitude") and c.get("longitude")
     ]
 
-    print(f"[ROUTE START] '{route_id}' | {len(device_ids)} devices | {len(polyline)} waypoints")
+    logger.info("Route '%s' started | %d devices | %d waypoints", route_id, len(device_ids), len(polyline))
 
     while True:
         # Drain queue
@@ -103,18 +106,25 @@ def route_thread_worker(route_id: str, device_ids: Set[str],
             while True:
                 msg = work_queue.get_nowait()
                 device_id = msg["device_id"]
-                _process_gps_on_route_thread(device_id, msg["payload"])
+                try:
+                    _process_gps_on_route_thread(device_id, msg["payload"])
+                except Exception:
+                    logger.exception("GPS processing failed for %s on route '%s'", device_id, route_id)
+                    continue
                 last_seen_local[device_id] = time.time()
 
                 # Apply polyline after first GPS (predictor now exists)
                 if device_id in polyline_pending and polyline:
-                    adapter.update_route_context(
-                        device_id=device_id,
-                        route_polyline=polyline,
-                        stops=None,
-                    )
-                    polyline_pending.discard(device_id)
-                    print(f"[CONTEXT] Polyline applied for {device_id} on '{route_id}'")
+                    try:
+                        adapter.update_route_context(
+                            device_id=device_id,
+                            route_polyline=polyline,
+                            stops=None,
+                        )
+                        polyline_pending.discard(device_id)
+                        logger.info("Polyline applied for %s on route '%s'", device_id, route_id)
+                    except Exception:
+                        logger.exception("Failed to apply polyline for %s on route '%s'", device_id, route_id)
         except queue.Empty:
             pass
 
@@ -124,52 +134,53 @@ def route_thread_worker(route_id: str, device_ids: Set[str],
         for d in expired:
             del last_seen_local[d]
             polyline_pending.discard(d)
-            print(f"[TIMEOUT] {d} on '{route_id}' silent >120s")
+            logger.warning("Device %s on route '%s' silent >120s, removing.", d, route_id)
 
         # Exit if all devices that ever sent GPS have expired
         if last_seen_local or not polyline_pending:
             if not last_seen_local:
-                print(f"[ROUTE EXIT] '{route_id}' — no active devices")
+                logger.info("Route '%s' exiting — no active devices.", route_id)
                 with routes_lock:
                     route_queues.pop(route_id, None)
                 break
 
         # Publish predictions
-        for device_id in list(last_seen_local.keys()):
-            predicted_pos = adapter.get_display_position(device_id)
-            if predicted_pos is not None:
-                r_pub.publish(
-                    f"{TOPIC_PREDICTED_OUT}:{device_id}",
-                    json.dumps(predicted_pos),
-                )
+        try:
+            for device_id in list(last_seen_local.keys()):
+                predicted_pos = adapter.get_display_position(device_id)
+                if predicted_pos is not None:
+                    r_pub.publish(
+                        f"{TOPIC_PREDICTED_OUT}:{device_id}",
+                        json.dumps(predicted_pos),
+                    )
+        except Exception:
+            logger.exception("Failed to predict/publish for route '%s'", route_id)
 
-        time.sleep(0.25)
+        # Sleep to achieve 1 publish per second
+        time.sleep(1.0)
 
 
 def main():
-    print("Starting Redis Prediction Daemon (Thread-Per-Route)...")
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    )
+    logger.info("Starting Redis Prediction Daemon (Thread-Per-Route)...")
 
-    # Fetch route-device mappings from API
-    try:
-        mappings = fetch_route_device_mappings()
-    except requests.RequestException as e:
-        print(f"[FATAL] API request failed: {e}")
-        return
-    except Exception as e:
-        print(f"[FATAL] Unexpected error: {e}")
-        return
+    # Fetch route-device mappings from API -- let errors propagate
+    mappings = fetch_route_device_mappings()
 
     if not mappings:
-        print("[WARN] No active routes found.")
+        logger.warning("No active routes found.")
 
-    # Build device → route lookup
+    # Build device-route lookup
     for route_id, info in mappings.items():
         for device_id in info["devices"]:
             device_to_route[device_id] = route_id
 
-    print(f"[INIT] {len(device_to_route)} devices across {len(mappings)} routes")
+    logger.info("%d devices across %d routes", len(device_to_route), len(mappings))
     for route_id, info in mappings.items():
-        print(f"  '{route_id}' → {info['devices']}")
+        logger.info("  Route '%s' -> %s", route_id, info['devices'])
 
     # Redis connections
     r_sub = redis.Redis.from_url(REDIS_URL, decode_responses=True)
@@ -191,13 +202,13 @@ def main():
     all_device_ids = list(device_to_route.keys())
 
     if not all_device_ids:
-        print("[WARN] No device channels to subscribe to.")
+        logger.warning("No device channels to subscribe to.")
         return
 
     pubsub.subscribe(*all_device_ids)
-    print(f"[INIT] Subscribed to {len(all_device_ids)} channels. Waiting for GPS...\n")
+    logger.info("Subscribed to %d channels. Waiting for GPS...", len(all_device_ids))
 
-    # Main loop — dispatch GPS to route threads
+    # Main loop -- dispatch GPS to route threads
     for message in pubsub.listen():
         if message["type"] == "message":
             device_id = message["channel"]
@@ -214,3 +225,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

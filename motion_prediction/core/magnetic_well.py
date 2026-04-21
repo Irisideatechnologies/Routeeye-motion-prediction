@@ -92,10 +92,7 @@ class MagneticWell:
                 phase="SLOWING"
             )
 
-            # Calculate target speed based on distance
-            # Linear deceleration: speed reduces proportionally to distance
-            # At 50m: current GPS speed
-            # At 10m: near zero
+           
             decel_progress = (distance - stop.snap_radius) / (stop.slowdown_radius - stop.snap_radius)
 
             # Target speed decreases as we approach
