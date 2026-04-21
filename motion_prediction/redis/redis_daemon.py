@@ -8,18 +8,16 @@ from typing import Dict, Set
 
 import redis
 import requests
-from dotenv import load_dotenv
 
 from motion_prediction.api.adapter2 import MotionPredictionAdapter
+from motion_prediction.config.env_loader import (
+    REDIS_URL,
+    API_ROUTES_URL,
+    API_BEARER_TOKEN,
+    TOPIC_PREDICTED_OUT,
+)
 
 logger = logging.getLogger(__name__)
-
-load_dotenv()
-
-REDIS_URL = os.environ["REDIS_URL"]
-API_ROUTES_URL = os.environ["API_ROUTES_URL"]
-API_BEARER_TOKEN = os.environ["API_BEARER_TOKEN"]
-TOPIC_PREDICTED_OUT = os.environ.get("TOPIC_PREDICTED_OUT", "gps:predicted")
 
 route_queues: Dict[str, queue.Queue] = {}
 device_to_route: Dict[str, str] = {}
