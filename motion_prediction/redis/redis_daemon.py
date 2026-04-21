@@ -160,7 +160,7 @@ def route_thread_worker(route_id: str, device_ids: Set[str],
         time.sleep(1.0)
 
 
-def main():
+def start_redis_daemon():
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
@@ -223,6 +223,5 @@ def main():
                 q.put({"device_id": device_id, "payload": payload})
 
 
-if __name__ == "__main__":
-    main()
+
 
