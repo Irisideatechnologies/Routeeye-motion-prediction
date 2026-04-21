@@ -2,8 +2,6 @@ import os
 import time
 import json
 import logging
-import threading
-import queue
 from typing import Dict, Set
 
 import redis
@@ -19,15 +17,13 @@ from motion_prediction.config.env_loader import (
 
 logger = logging.getLogger(__name__)
 
-route_queues: Dict[str, queue.Queue] = {}
 device_to_route: Dict[str, str] = {}
-routes_lock = threading.Lock()
 
 adapter = MotionPredictionAdapter(enabled=True)
 
 
 def fetch_route_device_mappings() -> dict:
-    
+    """Fetch active route-device mappings from the backend API."""
     headers = {"Authorization": f"Bearer {API_BEARER_TOKEN}"}
 
     resp = requests.get(API_ROUTES_URL, headers=headers, timeout=30)
@@ -64,10 +60,8 @@ def fetch_route_device_mappings() -> dict:
     return mappings
 
 
-def _process_gps_on_route_thread(device_id: str, payload_str: str) -> None:
-    """Parse and ingest a raw GPS packet. Runs on route thread, no lock needed.
-
-    """
+def _process_gps_packet(device_id: str, payload_str: str) -> None:
+    """Parse and ingest a raw GPS packet into the prediction adapter."""
     data = json.loads(payload_str)
     adapter.ingest_gps_packet(
         device_id=device_id,
@@ -78,92 +72,13 @@ def _process_gps_on_route_thread(device_id: str, payload_str: str) -> None:
     )
 
 
-def route_thread_worker(route_id: str, device_ids: Set[str],
-                        route_data: dict, r_pub: redis.Redis) -> None:
-    """Dedicated thread for one route. Drains GPS queue, polls predictions exactly at 1Hz (1s)."""
-    work_queue = route_queues[route_id]
-
-    # Devices added here only after their first GPS arrives (avoids premature timeout)
-    last_seen_local: Dict[str, float] = {}
-    polyline_pending: Set[str] = set(device_ids)
-
-    # Parse polyline once
-    coords = route_data.get("routeCoordinates", [])
-    sorted_coords = sorted(coords, key=lambda c: c.get("order", 0))
-    polyline = [
-        (float(c["latitude"]), float(c["longitude"]))
-        for c in sorted_coords
-        if c.get("latitude") and c.get("longitude")
-    ]
-
-    logger.info("Route '%s' started | %d devices | %d waypoints", route_id, len(device_ids), len(polyline))
-
-    while True:
-        # Drain queue
-        try:
-            while True:
-                msg = work_queue.get_nowait()
-                device_id = msg["device_id"]
-                try:
-                    _process_gps_on_route_thread(device_id, msg["payload"])
-                except Exception:
-                    logger.exception("GPS processing failed for %s on route '%s'", device_id, route_id)
-                    continue
-                last_seen_local[device_id] = time.time()
-
-                # Apply polyline after first GPS (predictor now exists)
-                if device_id in polyline_pending and polyline:
-                    try:
-                        adapter.update_route_context(
-                            device_id=device_id,
-                            route_polyline=polyline,
-                            stops=None,
-                        )
-                        polyline_pending.discard(device_id)
-                        logger.info("Polyline applied for %s on route '%s'", device_id, route_id)
-                    except Exception:
-                        logger.exception("Failed to apply polyline for %s on route '%s'", device_id, route_id)
-        except queue.Empty:
-            pass
-
-        # Timeout inactive devices (120s)
-        now = time.time()
-        expired = [d for d, ts in last_seen_local.items() if now - ts > 120]
-        for d in expired:
-            del last_seen_local[d]
-            polyline_pending.discard(d)
-            logger.warning("Device %s on route '%s' silent >120s, removing.", d, route_id)
-
-        # Exit if all devices that ever sent GPS have expired
-        if last_seen_local or not polyline_pending:
-            if not last_seen_local:
-                logger.info("Route '%s' exiting — no active devices.", route_id)
-                with routes_lock:
-                    route_queues.pop(route_id, None)
-                break
-
-        # Publish predictions
-        try:
-            for device_id in list(last_seen_local.keys()):
-                predicted_pos = adapter.get_display_position(device_id)
-                if predicted_pos is not None:
-                    r_pub.publish(
-                        f"{TOPIC_PREDICTED_OUT}:{device_id}",
-                        json.dumps(predicted_pos),
-                    )
-        except Exception:
-            logger.exception("Failed to predict/publish for route '%s'", route_id)
-
-        # Sleep to achieve 1 publish per second
-        time.sleep(1.0)
-
-
 def start_redis_daemon():
+    """Single-threaded daemon: ingests GPS, runs predictions, publishes at 1Hz."""
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     )
-    logger.info("Starting Redis Prediction Daemon (Thread-Per-Route)...")
+    logger.info("Starting Redis Prediction Daemon (Single-Thread)...")
 
     # Fetch route-device mappings from API -- let errors propagate
     mappings = fetch_route_device_mappings()
@@ -171,29 +86,31 @@ def start_redis_daemon():
     if not mappings:
         logger.warning("No active routes found.")
 
-    # Build device-route lookup
+    # Build device-route lookup and parse polylines per route
+    route_polylines: Dict[str, list] = {}
+
     for route_id, info in mappings.items():
         for device_id in info["devices"]:
             device_to_route[device_id] = route_id
 
+        # Parse polyline once per route
+        coords = info["route_data"].get("routeCoordinates", [])
+        sorted_coords = sorted(coords, key=lambda c: c.get("order", 0))
+        polyline = [
+            (float(c["latitude"]), float(c["longitude"]))
+            for c in sorted_coords
+            if c.get("latitude") and c.get("longitude")
+        ]
+        route_polylines[route_id] = polyline
+
     logger.info("%d devices across %d routes", len(device_to_route), len(mappings))
     for route_id, info in mappings.items():
-        logger.info("  Route '%s' -> %s", route_id, info['devices'])
+        logger.info("  Route '%s' -> %s (%d waypoints)",
+                     route_id, info['devices'], len(route_polylines[route_id]))
 
     # Redis connections
     r_sub = redis.Redis.from_url(REDIS_URL, decode_responses=True)
     r_pub = redis.Redis.from_url(REDIS_URL, decode_responses=True)
-
-    # Spawn route threads
-    for route_id, info in mappings.items():
-        route_queues[route_id] = queue.Queue()
-        t = threading.Thread(
-            target=route_thread_worker,
-            args=(route_id, info["devices"], info["route_data"], r_pub),
-            daemon=True,
-            name=f"RouteThread-{route_id}",
-        )
-        t.start()
 
     # Subscribe to each device channel
     pubsub = r_sub.pubsub()
@@ -206,9 +123,17 @@ def start_redis_daemon():
     pubsub.subscribe(*all_device_ids)
     logger.info("Subscribed to %d channels. Waiting for GPS...", len(all_device_ids))
 
-    # Main loop -- dispatch GPS to route threads
-    for message in pubsub.listen():
-        if message["type"] == "message":
+    # Tracking state
+    last_seen: Dict[str, float] = {}
+    polyline_pending: Set[str] = set(all_device_ids)
+    last_publish_time = time.time()
+
+    # --- Single-threaded event loop ---
+    while True:
+        # Poll for GPS messages (non-blocking, with short timeout)
+        message = pubsub.get_message(ignore_subscribe_messages=True, timeout=0.1)
+
+        if message and message["type"] == "message":
             device_id = message["channel"]
             payload = message["data"]
 
@@ -216,10 +141,50 @@ def start_redis_daemon():
             if route_id is None:
                 continue
 
-            q = route_queues.get(route_id)
-            if q is not None:
-                q.put({"device_id": device_id, "payload": payload})
+            # Ingest GPS packet
+            try:
+                _process_gps_packet(device_id, payload)
+            except Exception:
+                logger.exception("GPS processing failed for %s on route '%s'", device_id, route_id)
+                continue
 
+            last_seen[device_id] = time.time()
 
+            # Apply polyline after first GPS (predictor now exists)
+            if device_id in polyline_pending:
+                polyline = route_polylines.get(route_id, [])
+                if polyline:
+                    try:
+                        adapter.update_route_context(
+                            device_id=device_id,
+                            route_polyline=polyline,
+                            stops=None,
+                        )
+                        polyline_pending.discard(device_id)
+                        logger.info("Polyline applied for %s on route '%s'", device_id, route_id)
+                    except Exception:
+                        logger.exception("Failed to apply polyline for %s on route '%s'", device_id, route_id)
 
+        # --- Publish predictions every 1 second ---
+        now = time.time()
+        if now - last_publish_time >= 1.0:
+            last_publish_time = now
 
+            # Timeout inactive devices (120s)
+            expired = [d for d, ts in last_seen.items() if now - ts > 120]
+            for d in expired:
+                del last_seen[d]
+                polyline_pending.discard(d)
+                logger.warning("Device %s silent >120s, removing.", d)
+
+            # Publish predictions for all active devices
+            for device_id in list(last_seen.keys()):
+                try:
+                    predicted_pos = adapter.get_display_position(device_id)
+                    if predicted_pos is not None:
+                        r_pub.publish(
+                            f"{TOPIC_PREDICTED_OUT}:{device_id}",
+                            json.dumps(predicted_pos),
+                        )
+                except Exception:
+                    logger.exception("Failed to predict/publish for device %s", device_id)
