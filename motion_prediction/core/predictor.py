@@ -44,7 +44,7 @@ class VehiclePredictor:
             stops: Optional[List[Tuple[str, float, float]]] = None,
     ) -> None:
         
-        print(f"🔧 Predictor.update_route_context called:")
+        print(f"Predictor.update_route_context called:")
         print(f"   Route polyline: {len(route_polyline) if route_polyline else 0} waypoints")
         print(f"   Stops: {len(stops) if stops else 0} stops")
 
