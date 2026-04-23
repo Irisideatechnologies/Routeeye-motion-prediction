@@ -1,13 +1,23 @@
 from __future__ import annotations
-from typing import Optional, Tuple
+from typing import Optional, Tuple, List
 import math
 
 from motion_prediction.math.vector import Vec2
 from motion_prediction.core.route_geometry import RouteGeometry
 
 GPS_POSITION_THRESHOLD_M = 10.0
-class RouteFollower:
 
+# How many segments backward from the current position we allow GPS correction.
+# This prevents the bus from teleporting to a parallel return lane while still
+# allowing minor GPS jitter corrections.
+BACKWARD_SEARCH_SEGMENTS = 3
+
+# Maximum forward jump in segments allowed from a single GPS fix.
+# Prevents matching to a topologically distant but geometrically close segment.
+FORWARD_SEARCH_SEGMENTS = 30
+
+
+class RouteFollower:
 
     def __init__(self, route: RouteGeometry):
         self.route = route
@@ -16,8 +26,8 @@ class RouteFollower:
         self._current_segment_idx: int = 0
         self._segment_progress: float = 0.0  # 0.0 to 1.0 within segment
 
-        
         self._last_route_point: Optional[Vec2] = None
+
         if len(route.polyline) >= 2:
             overall = route.polyline[-1] - route.polyline[0]
             self._forward_dir: Vec2 = overall.normalized() if overall.magnitude() > 1e-6 else Vec2(0.0, 1.0)
@@ -25,22 +35,130 @@ class RouteFollower:
             self._forward_dir = Vec2(0.0, 1.0)
 
         self._is_reversed: bool = False
+
+        # --- Monotonic route-distance tracking ---
+        # Pre-compute cumulative arc-length at each waypoint for O(1) distance lookups.
+        # _cumulative_dist[i] = total distance from polyline[0] to polyline[i].
+        self._cumulative_dist: List[float] = self._build_cumulative_distances()
+
+        # Current scalar position along the route (meters from start).
+        self._current_route_dist: float = 0.0
+
+        # Total route length for convenience.
+        self._total_route_length: float = (
+            self._cumulative_dist[-1] if self._cumulative_dist else 0.0
+        )
+
+        # Whether locate_on_route has been called at least once (first call
+        # uses global search to establish initial position).
+        self._initialized: bool = False
+
+    # ------------------------------------------------------------------ #
+    #  Pre-computation
+    # ------------------------------------------------------------------ #
+
+    def _build_cumulative_distances(self) -> List[float]:
+        """Build a cumulative arc-length table for the polyline."""
+        polyline = self.route.polyline
+        if len(polyline) < 2:
+            return [0.0] * len(polyline)
+
+        cumulative = [0.0]
+        for i in range(1, len(polyline)):
+            seg_len = (polyline[i] - polyline[i - 1]).magnitude()
+            cumulative.append(cumulative[-1] + seg_len)
+        return cumulative
+
+    def _segment_start_dist(self, seg_idx: int) -> float:
+        """Get the cumulative distance at the start of segment seg_idx."""
+        return self._cumulative_dist[seg_idx]
+
+    def _route_dist_at(self, seg_idx: int, progress: float) -> float:
+        """Get an absolute route distance for a (segment, progress) pair."""
+        if seg_idx >= len(self.route.polyline) - 1:
+            return self._cumulative_dist[-1]
+        seg_len = self._cumulative_dist[seg_idx + 1] - self._cumulative_dist[seg_idx]
+        return self._cumulative_dist[seg_idx] + seg_len * progress
+
+    # ------------------------------------------------------------------ #
+    #  Core: locate on route (monotonic-forward search)
+    # ------------------------------------------------------------------ #
+
     def locate_on_route(self, position: Vec2) -> Tuple[Vec2, int, float]:
 
         if len(self.route.polyline) < 2:
             return position, 0, 0.0
 
+        num_segments = len(self.route.polyline) - 1
+
+        # --- First call: global search to seed initial position ---
+        if not self._initialized:
+            best_point, best_seg, best_prog = self._global_locate(position)
+            self._initialized = True
+            self._current_segment_idx = best_seg
+            self._segment_progress = best_prog
+            self._current_route_dist = self._route_dist_at(best_seg, best_prog)
+            self._last_route_point = best_point
+            dist = (position - best_point).magnitude()
+            if dist <= GPS_POSITION_THRESHOLD_M:
+                return best_point, best_seg, best_prog
+            return position, best_seg, best_prog
+
+        # --- Subsequent calls: windowed search around current position ---
+        search_start = max(0, self._current_segment_idx - BACKWARD_SEARCH_SEGMENTS)
+        search_end = min(num_segments, self._current_segment_idx + FORWARD_SEARCH_SEGMENTS)
+
+        min_distance = float('inf')
+        best_point = position
+        best_segment = self._current_segment_idx
+        best_progress = self._segment_progress
+
+        for i in range(search_start, search_end):
+            p1 = self.route.polyline[i]
+            p2 = self.route.polyline[i + 1]
+
+            point, progress = self._project_onto_segment(position, p1, p2)
+            distance = (position - point).magnitude()
+
+            candidate_dist = self._route_dist_at(i, progress)
+
+            # --- Monotonic constraint ---
+            # Only accept candidates that are at or ahead of the current
+            # position minus a small backward tolerance (for GPS jitter).
+            backward_tolerance = 15.0  # meters
+            if candidate_dist < self._current_route_dist - backward_tolerance:
+                continue
+
+            if distance < min_distance:
+                min_distance = distance
+                best_point = point
+                best_segment = i
+                best_progress = progress
+
+        # Update state — route distance can only move forward (with jitter tolerance)
+        new_route_dist = self._route_dist_at(best_segment, best_progress)
+        if new_route_dist >= self._current_route_dist - 15.0:
+            self._current_route_dist = max(self._current_route_dist, new_route_dist)
+
+        self._current_segment_idx = best_segment
+        self._segment_progress = best_progress
+        self._last_route_point = best_point
+
+        if min_distance <= GPS_POSITION_THRESHOLD_M:
+            return best_point, best_segment, best_progress
+        return position, best_segment, best_progress
+
+    def _global_locate(self, position: Vec2) -> Tuple[Vec2, int, float]:
+        """Unrestricted global search — used only for initialisation."""
         min_distance = float('inf')
         best_point = position
         best_segment = 0
         best_progress = 0.0
 
-        # Check each segment of the polyline
         for i in range(len(self.route.polyline) - 1):
             p1 = self.route.polyline[i]
             p2 = self.route.polyline[i + 1]
 
-            # Project position onto this segment
             point, progress = self._project_onto_segment(position, p1, p2)
             distance = (position - point).magnitude()
 
@@ -50,13 +168,12 @@ class RouteFollower:
                 best_segment = i
                 best_progress = progress
 
-        self._current_segment_idx = best_segment
-        self._segment_progress = best_progress
-        self._last_route_point = best_point
+        return best_point, best_segment, best_progress
 
-        if min_distance <= GPS_POSITION_THRESHOLD_M:
-            return best_point, best_segment, best_progress
-        return position, best_segment, best_progress
+    # ------------------------------------------------------------------ #
+    #  Advance along route
+    # ------------------------------------------------------------------ #
+
     def advance_along_route(
             self,
             current_position: Vec2,
@@ -65,8 +182,7 @@ class RouteFollower:
             confidence: float,
     ) -> Tuple[Vec2, Vec2]:
 
-
-        # ALWAYS locate on route (project onto polyline)
+        # ALWAYS locate on route (project onto polyline — now windowed)
         route_point, segment_idx, progress = self.locate_on_route(current_position)
 
         # Check if extremely far from route (>100m)
@@ -109,6 +225,19 @@ class RouteFollower:
         self._current_segment_idx = 0
         self._segment_progress = 0.0
         self._last_route_point = None
+
+        # Rebuild cumulative distances and reset route distance
+        self._cumulative_dist = self._build_cumulative_distances()
+        self._total_route_length = (
+            self._cumulative_dist[-1] if self._cumulative_dist else 0.0
+        )
+        self._current_route_dist = 0.0
+        self._initialized = False
+
+    # ------------------------------------------------------------------ #
+    #  Traverse route (unchanged logic, now updates route distance)
+    # ------------------------------------------------------------------ #
+
     def _traverse_route(
             self,
             start_segment: int,
@@ -170,7 +299,15 @@ class RouteFollower:
         self._segment_progress = current_progress
         self._last_route_point = final_position
 
+        # Update monotonic route distance (can only increase via traversal)
+        new_dist = self._route_dist_at(current_segment, current_progress)
+        self._current_route_dist = max(self._current_route_dist, new_dist)
+
         return final_position, direction
+
+    # ------------------------------------------------------------------ #
+    #  Segment projection (unchanged)
+    # ------------------------------------------------------------------ #
 
     def _project_onto_segment(
             self,
@@ -197,6 +334,10 @@ class RouteFollower:
 
         return projected, t
 
+    # ------------------------------------------------------------------ #
+    #  Query helpers
+    # ------------------------------------------------------------------ #
+
     def get_distance_from_route(self, position: Vec2) -> float:
 
         if self._last_route_point is None:
@@ -204,17 +345,20 @@ class RouteFollower:
 
         return (position - self._last_route_point).magnitude()
 
+    def get_route_progress(self) -> float:
+        """Return the current progress along the route as a fraction 0.0–1.0."""
+        if self._total_route_length < 1e-6:
+            return 0.0
+        return min(1.0, self._current_route_dist / self._total_route_length)
+
+    def get_route_distance(self) -> float:
+        """Return the current absolute distance along the route in meters."""
+        return self._current_route_dist
+
     def is_near_route_end(self, threshold_meters: float = 50.0) -> bool:
 
         if len(self.route.polyline) < 2:
             return False
 
-        # Check if on last segment and near the end
-        is_last_segment = self._current_segment_idx >= len(self.route.polyline) - 2
-
-        if is_last_segment and self._last_route_point:
-            end_point = self.route.polyline[-1]
-            distance_to_end = (self._last_route_point - end_point).magnitude()
-            return distance_to_end < threshold_meters
-
-        return False
+        remaining = self._total_route_length - self._current_route_dist
+        return remaining < threshold_meters
