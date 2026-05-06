@@ -11,7 +11,9 @@ from motion_prediction.api.adapter2 import MotionPredictionAdapter
 from motion_prediction.config.env_loader import (
     REDIS_URL,
     API_ROUTES_URL,
+    API_DIRECTIONS_BASE_URL,
     API_BEARER_TOKEN,
+    API_COOKIE,
     TOPIC_PREDICTED_OUT,
 )
 
@@ -24,11 +26,14 @@ adapter = MotionPredictionAdapter(enabled=True)
 
 def fetch_route_device_mappings() -> dict:
     """Fetch active route-device mappings from the backend API."""
-    headers = {"Authorization": f"Bearer {API_BEARER_TOKEN}"}
-
-    resp = requests.get(API_ROUTES_URL, headers=headers, timeout=30)
-    resp.raise_for_status()
-    routes_json = resp.json()
+    if API_ROUTES_URL.endswith(".json"):
+        with open(API_ROUTES_URL, "r") as f:
+            routes_json = json.load(f)
+    else:
+        headers = {"Authorization": f"Bearer {API_BEARER_TOKEN}"}
+        resp = requests.get(API_ROUTES_URL, headers=headers, timeout=30)
+        resp.raise_for_status()
+        routes_json = resp.json()
 
     mappings = {}
     seen_devices: Set[str] = set()
@@ -59,14 +64,70 @@ def fetch_route_device_mappings() -> dict:
 
     return mappings
 
+def decode_polyline(polyline_str: str) -> list:
+    """Decode a Google Maps encoded polyline into a list of (lat, lon) tuples."""
+    index, lat, lng = 0, 0, 0
+    coordinates = []
+    changes = {'latitude': 0, 'longitude': 0}
+    while index < len(polyline_str):
+        for unit in ['latitude', 'longitude']:
+            shift, result = 0, 0
+            while True:
+                byte = ord(polyline_str[index]) - 63
+                index += 1
+                result |= (byte & 0x1f) << shift
+                shift += 5
+                if not byte >= 0x20:
+                    break
+            if (result & 1):
+                changes[unit] = ~(result >> 1)
+            else:
+                changes[unit] = (result >> 1)
+        lat += changes['latitude']
+        lng += changes['longitude']
+        coordinates.append((lat / 100000.0, lng / 100000.0))
+    return coordinates
+
+def fetch_route_geometry(route_id: str) -> list:
+    """Fetch and decode the route polyline from the Directions API."""
+    if route_id.lower() != "route8h":
+        return []
+        
+    url = API_DIRECTIONS_BASE_URL.replace("{route_id}", route_id)
+    headers = {"Authorization": f"Bearer {API_BEARER_TOKEN}"}
+    if API_COOKIE:
+        headers["Cookie"] = API_COOKIE
+        
+    try:
+        resp = requests.get(url, headers=headers, timeout=15)
+        resp.raise_for_status()
+        data = resp.json()
+        
+        if 'directions' in data and 'routes' in data['directions']:
+            routes = data['directions']['routes']
+            if len(routes) > 0 and 'legs' in routes[0]:
+                path = []
+                for leg in routes[0]['legs']:
+                    for step in leg.get('steps', []):
+                        if 'polyline' in step and 'points' in step['polyline']:
+                            pts = step['polyline']['points']
+                            path.extend(decode_polyline(pts))
+                if path:
+                    return path
+        logger.warning(f"No valid directions found in API for route {route_id}")
+    except Exception as e:
+        logger.error(f"Failed to fetch directions for route {route_id}: {e}")
+        
+    return []
+
 
 def _process_gps_packet(device_id: str, payload_str: str) -> None:
     """Parse and ingest a raw GPS packet into the prediction adapter."""
     data = json.loads(payload_str)
     adapter.ingest_gps_packet(
         device_id=device_id,
-        latitude=str(data.get("lat")) if data.get("lat") is not None else "0",
-        longitude=str(data.get("lon")) if data.get("lon") is not None else "0",
+        latitude=str(data.get("latitude", data.get("lat"))) if data.get("latitude", data.get("lat")) is not None else "0",
+        longitude=str(data.get("longitude", data.get("lon"))) if data.get("longitude", data.get("lon")) is not None else "0",
         timestamp=int(data.get("timestamp", time.time() * 1000)),
         speed=str(data["speed"]) if data.get("speed") is not None else None,
     )
@@ -93,15 +154,14 @@ def start_redis_daemon():
         for device_id in info["devices"]:
             device_to_route[device_id] = route_id
 
-        # Parse polyline once per route
-        coords = info["route_data"].get("routeCoordinates", [])
-        sorted_coords = sorted(coords, key=lambda c: c.get("order", 0))
-        polyline = [
-            (float(c["latitude"]), float(c["longitude"]))
-            for c in sorted_coords
-            if c.get("latitude") and c.get("longitude")
-        ]
-        route_polylines[route_id] = polyline
+        # Fetch route geometry from the new Directions API
+        logger.info(f"Fetching geometry for route {route_id}...")
+        polyline = fetch_route_geometry(route_id)
+        if polyline:
+            route_polylines[route_id] = polyline
+        else:
+            logger.warning(f"Failed to fetch proper directions polyline for route {route_id}")
+            route_polylines[route_id] = []
 
     logger.info("%d devices across %d routes", len(device_to_route), len(mappings))
     for route_id, info in mappings.items():
