@@ -13,7 +13,6 @@ from motion_prediction.config.env_loader import (
     API_ROUTES_URL,
     API_DIRECTIONS_BASE_URL,
     API_BEARER_TOKEN,
-    API_COOKIE,
     TOPIC_PREDICTED_OUT,
 )
 
@@ -95,8 +94,6 @@ def fetch_route_geometry(route_id: str) -> list:
         
     url = API_DIRECTIONS_BASE_URL.replace("{route_id}", route_id)
     headers = {"Authorization": f"Bearer {API_BEARER_TOKEN}"}
-    if API_COOKIE:
-        headers["Cookie"] = API_COOKIE
         
     try:
         resp = requests.get(url, headers=headers, timeout=15)
@@ -171,6 +168,7 @@ def start_redis_daemon():
     # Redis connections
     r_sub = redis.Redis.from_url(REDIS_URL, decode_responses=True)
     r_pub = redis.Redis.from_url(REDIS_URL, decode_responses=True)
+    print()
 
     # Subscribe to each device channel
     pubsub = r_sub.pubsub()
@@ -196,7 +194,7 @@ def start_redis_daemon():
         if message and message["type"] == "message":
             device_id = message["channel"]
             payload = message["data"]
-
+            # print(payload,"Line Number 200")
             route_id = device_to_route.get(device_id)
             if route_id is None:
                 continue

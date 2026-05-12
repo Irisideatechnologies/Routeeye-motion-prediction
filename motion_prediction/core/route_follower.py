@@ -174,6 +174,27 @@ class RouteFollower:
     #  Advance along route
     # ------------------------------------------------------------------ #
 
+    def nearest_route_distance(self, position: Vec2) -> float:
+        """Return distance from position to nearest point on route polyline.
+        
+        This is a READ-ONLY method — it does NOT mutate any internal state.
+        Used for off-route detection before deciding whether to engage route following.
+        """
+        if len(self.route.polyline) < 2:
+            return float('inf')
+
+        min_dist = float('inf')
+        for i in range(len(self.route.polyline) - 1):
+            p1 = self.route.polyline[i]
+            p2 = self.route.polyline[i + 1]
+            point, _ = self._project_onto_segment(position, p1, p2)
+            dist = (position - point).magnitude()
+            if dist < min_dist:
+                min_dist = dist
+            if min_dist < 1.0:  # Close enough, no need to keep searching
+                break
+        return min_dist
+
     def advance_along_route(
             self,
             current_position: Vec2,
@@ -188,9 +209,8 @@ class RouteFollower:
         # Check if extremely far from route (>100m)
         distance_from_route = (current_position - route_point).magnitude()
         if distance_from_route > 100.0:
-            
-            # Trust route position, but zero velocity until GPS corrects
-            return route_point, Vec2.zero()
+            # Vehicle is way off-route — don't snap, just return current position
+            return current_position, Vec2.zero()
 
 
         blend_factor = 0.3 + 0.7 * (1.0 - confidence)

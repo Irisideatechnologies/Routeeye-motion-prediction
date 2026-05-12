@@ -41,6 +41,10 @@ class BackgroundState:
     # Route-following support
     route_follower: Optional['RouteFollower'] = None
 
+    # Off-route detection: when vehicle is far from route (parking, depot),
+    # skip route following and just hold at raw GPS position.
+    _off_route: bool = False
+
    
     marker_position: Vec2 = None  # Current visual marker position
     marker_velocity: Vec2 = None  # Current visual marker velocity
@@ -85,6 +89,29 @@ class BackgroundState:
 
         gps_pos = latlon_to_xy(lat, lon, self.ref_lat, self.ref_lon)
         dt = max(ts - self.last_gps_ts, 1e-3)
+
+        # --- OFF-ROUTE DETECTION (runs before all branches) ---
+        # Check distance from route polyline on every GPS fix.
+        # If vehicle is >50m from route (parking, depot), disable route following.
+        OFF_ROUTE_THRESHOLD_M = 50.0
+        ON_ROUTE_THRESHOLD_M = 30.0  # Hysteresis: must come closer to re-engage
+
+        if self.route_follower:
+            dist = self.route_follower.nearest_route_distance(gps_pos)
+            if not self._off_route and dist > OFF_ROUTE_THRESHOLD_M:
+                self._off_route = True
+                import logging
+                logging.getLogger(__name__).info(
+                    "Vehicle went OFF-ROUTE (%.0fm from polyline). Holding at GPS position.", dist
+                )
+            elif self._off_route and dist < ON_ROUTE_THRESHOLD_M:
+                self._off_route = False
+                # Re-initialize route follower for clean handoff
+                self.route_follower._initialized = False
+                import logging
+                logging.getLogger(__name__).info(
+                    "Vehicle returned ON-ROUTE (%.0fm from polyline). Resuming route following.", dist
+                )
 
         # --- STOP ---
         if speed_mps is not None and speed_mps < 0.3:
@@ -131,6 +158,21 @@ class BackgroundState:
             delta = gps_pos - self.last_gps_position
             if delta.magnitude() > 0.5:
                 direction = delta.normalized()
+                
+                # --- AUTO-REVERSE ROUTE FOLLOWER IF MOVING BACKWARDS ---
+                if self.route_follower and not getattr(self.route_follower, '_direction_verified', False) and delta.magnitude() > 5.0:
+                    p1, seg1, prog1 = self.route_follower._global_locate(self.last_gps_position)
+                    p2, seg2, prog2 = self.route_follower._global_locate(gps_pos)
+                    
+                    dist1 = self.route_follower._route_dist_at(seg1, prog1)
+                    dist2 = self.route_follower._route_dist_at(seg2, prog2)
+                    
+                    if dist2 < dist1 - 2.0:
+                        import logging
+                        logging.getLogger(__name__).info("Auto-reversing route follower for inbound vehicle!")
+                        self.route_follower.reverse()
+                    
+                    self.route_follower._direction_verified = True
 
             # 2. Try current velocity direction
             elif self.velocity.magnitude() > 0.5:
@@ -208,17 +250,23 @@ class BackgroundState:
 
         speed_before_route = self.velocity.magnitude()
         
-        # ROUTE-FOLLOWING: ALWAYS ACTIVE WHEN ROUTE AVAILABLE
+        # ROUTE-FOLLOWING: active when route is available AND vehicle is on-route
         
 
-        if self.route_follower:
-            # ALWAYS use route-following to keep marker on visible route line
+        if self.route_follower and not self._off_route:
+            # Vehicle is on-route: use route-following to keep marker on polyline
             self.position, self.velocity = self.route_follower.advance_along_route(
                 current_position=self.position,
                 speed=self.velocity.magnitude(),
                 dt=dt,
                 confidence=self.confidence,
             )
+        elif self._off_route:
+            # Vehicle is OFF-ROUTE (parking, depot, etc.)
+            # Just hold at the last GPS position — no prediction, no dead-reckoning.
+            # Position is already set to gps_pos in apply_gps_fix(), so do nothing.
+            self.velocity = Vec2.zero()
+            self.acceleration = Vec2.zero()
         else:
             # No route available - use normal physics-based position
             prev = self.position

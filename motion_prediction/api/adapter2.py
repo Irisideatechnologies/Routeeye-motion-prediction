@@ -8,7 +8,7 @@ from motion_prediction.models.gps_packet import GPSPacket
 
 # Sliding window configuration
 SPEED_WINDOW_SIZE = 12        # Number of packets to average over
-SPEED_COLLECT_THRESHOLD = 12.0  # Only collect speeds above this (km/h)
+SPEED_COLLECT_THRESHOLD = 8.0  # Only collect speeds above this (km/h)
 SPEED_STOP_THRESHOLD = 4.0     # Below this → vehicle is stopped (km/h)
 PRESET_AVG_SPEED_KMPH = 12.0   # Default avg speed until window is full
 
