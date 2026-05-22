@@ -195,6 +195,29 @@ class RouteFollower:
                 break
         return min_dist
 
+    def snap_to_route(self, position: Vec2) -> Vec2:
+        """Return the nearest point on the route polyline to the given position.
+        
+        This is a READ-ONLY method — it does NOT mutate any internal state.
+        Used to clamp noisy GPS data onto the road before ingestion.
+        """
+        if len(self.route.polyline) < 2:
+            return position  # No route to snap to
+
+        min_dist = float('inf')
+        best_point = position
+        for i in range(len(self.route.polyline) - 1):
+            p1 = self.route.polyline[i]
+            p2 = self.route.polyline[i + 1]
+            point, _ = self._project_onto_segment(position, p1, p2)
+            dist = (position - point).magnitude()
+            if dist < min_dist:
+                min_dist = dist
+                best_point = point
+            if min_dist < 1.0:  # Close enough, no need to keep searching
+                break
+        return best_point
+
     def advance_along_route(
             self,
             current_position: Vec2,
@@ -213,7 +236,7 @@ class RouteFollower:
             return current_position, Vec2.zero()
 
 
-        blend_factor = 0.3 + 0.7 * (1.0 - confidence)
+        blend_factor = 0.7 + 0.3 * (1.0 - confidence)
 
         # Distance to travel this tick
         distance_to_travel = speed * dt

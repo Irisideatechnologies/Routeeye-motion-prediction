@@ -79,16 +79,20 @@ class MotionPredictionAdapter:
                 if speed_val < SPEED_STOP_THRESHOLD:
                     speed_mps = 0.0
 
-                # MOVING: GPS speed >= 4 km/h → use sliding window average
+                # MOVING: GPS speed >= 4 km/h
                 else:
-                    # Collect into window if above 12 km/h
+                    # Collect into window if above 8 km/h
                     if speed_val > SPEED_COLLECT_THRESHOLD:
                         window = self._get_speed_window(device_id)
                         window.append(speed_val)
 
-                    # Use the computed average (or preset 12 if window not full)
-                    avg_kmph = self._get_avg_speed_kmph(device_id)
-                    speed_mps = avg_kmph / 3.6
+                    # 4–8 km/h: use actual GPS speed (avoids 12 km/h preset overshoot)
+                    # >8 km/h: use sliding window average for smooth prediction
+                    if speed_val <= SPEED_COLLECT_THRESHOLD:
+                        speed_mps = speed_val / 3.6
+                    else:
+                        avg_kmph = self._get_avg_speed_kmph(device_id)
+                        speed_mps = avg_kmph / 3.6
 
             else:
                 speed_mps = None

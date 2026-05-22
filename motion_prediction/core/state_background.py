@@ -92,9 +92,11 @@ class BackgroundState:
 
         # --- OFF-ROUTE DETECTION (runs before all branches) ---
         # Check distance from route polyline on every GPS fix.
-        # If vehicle is >50m from route (parking, depot), disable route following.
-        OFF_ROUTE_THRESHOLD_M = 50.0
-        ON_ROUTE_THRESHOLD_M = 30.0  # Hysteresis: must come closer to re-engage
+        # If vehicle is >75m from route (parking, depot), disable route following.
+        # Threshold is set high enough to tolerate GPS noise (~35m) without
+        # falsely triggering off-route mode.
+        OFF_ROUTE_THRESHOLD_M = 75.0
+        ON_ROUTE_THRESHOLD_M = 40.0  # Hysteresis: must come closer to re-engage
 
         if self.route_follower:
             dist = self.route_follower.nearest_route_distance(gps_pos)
@@ -112,6 +114,12 @@ class BackgroundState:
                 logging.getLogger(__name__).info(
                     "Vehicle returned ON-ROUTE (%.0fm from polyline). Resuming route following.", dist
                 )
+
+        # --- GPS SNAP TO ROUTE (filters noisy GPS that drifts off-road) ---
+        # When vehicle is on-route, project raw GPS onto the nearest route
+        # segment so the marker never leaves the road, even with ~35m GPS error.
+        if self.route_follower and not self._off_route:
+            gps_pos = self.route_follower.snap_to_route(gps_pos)
 
         # --- STOP ---
         if speed_mps is not None and speed_mps < 0.3:
@@ -241,6 +249,12 @@ class BackgroundState:
         # --- Brake bias ---
         if self.confidence < 0.43:
             self.velocity = apply_braking_bias(self.velocity, BRAKE_STRENGTH, dt)
+
+        # --- Velocity floor: snap to zero below 1 km/h (0.2778 m/s) ---
+        VELOCITY_FLOOR_MPS = 1.0 / 3.6  # 1 km/h
+        if self.velocity.magnitude() < VELOCITY_FLOOR_MPS:
+            self.velocity = Vec2.zero()
+            self.acceleration = Vec2.zero()
 
         # --- Hard stop ---
         if self.confidence <= DEAD_RECKON_STOP_CONF:
