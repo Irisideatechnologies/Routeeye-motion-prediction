@@ -1,0 +1,278 @@
+import os
+import time
+import json
+import logging
+from typing import Dict, Set
+
+import redis
+import requests
+
+from motion_prediction.api.adapter2 import MotionPredictionAdapter
+from motion_prediction.config.env_loader import (
+    REDIS_URL,
+    API_ROUTES_URL,
+    API_DIRECTIONS_BASE_URL,
+    API_BEARER_TOKEN,
+    TOPIC_PREDICTED_OUT,
+)
+
+logger = logging.getLogger(__name__)
+
+device_to_route: Dict[str, str] = {}
+
+adapter = MotionPredictionAdapter(enabled=True)
+
+
+def fetch_route_device_mappings() -> dict:
+    """Fetch active route-device mappings from the backend API."""
+    if API_ROUTES_URL.endswith(".json"):
+        with open(API_ROUTES_URL, "r") as f:
+            routes_json = json.load(f)
+    else:
+        headers = {"Authorization": f"Bearer {API_BEARER_TOKEN}"}
+        resp = requests.get(API_ROUTES_URL, headers=headers, timeout=30)
+        resp.raise_for_status()
+        routes_json = resp.json()
+
+    mappings = {}
+    seen_devices: Set[str] = set()
+
+    for route in routes_json:
+        route_id = route.get("routeId")
+        if not route_id:
+            continue
+
+        active_devices: Set[str] = set()
+        for vehicle in route.get("vehicles", []):
+            if vehicle.get("deletedAt") is not None:
+                continue
+            if vehicle.get("isDeleted", False):
+                continue
+            device_id = vehicle.get("device_id")
+            if device_id and device_id not in seen_devices:
+                active_devices.add(device_id)
+                seen_devices.add(device_id)
+            elif device_id and device_id in seen_devices:
+                logger.warning("Device '%s' duplicate on route '%s', skipping.", device_id, route_id)
+
+        if active_devices:
+            mappings[route_id] = {
+                "devices": active_devices,
+                "route_data": route,
+            }
+
+    return mappings
+
+def decode_polyline(polyline_str: str) -> list:
+    """Decode a Google Maps encoded polyline into a list of (lat, lon) tuples."""
+    index, lat, lng = 0, 0, 0
+    coordinates = []
+    changes = {'latitude': 0, 'longitude': 0}
+    while index < len(polyline_str):
+        for unit in ['latitude', 'longitude']:
+            shift, result = 0, 0
+            while True:
+                byte = ord(polyline_str[index]) - 63
+                index += 1
+                result |= (byte & 0x1f) << shift
+                shift += 5
+                if not byte >= 0x20:
+                    break
+            if (result & 1):
+                changes[unit] = ~(result >> 1)
+            else:
+                changes[unit] = (result >> 1)
+        lat += changes['latitude']
+        lng += changes['longitude']
+        coordinates.append((lat / 100000.0, lng / 100000.0))
+    return coordinates
+
+def fetch_route_geometry(route_id: str) -> list:
+    """Fetch and decode the route polyline from the Directions API."""
+        
+    url = API_DIRECTIONS_BASE_URL.replace("{route_id}", route_id)
+    headers = {"Authorization": f"Bearer {API_BEARER_TOKEN}"}
+        
+    try:
+        resp = requests.get(url, headers=headers, timeout=15)
+        resp.raise_for_status()
+        data = resp.json()
+        
+        if 'directions' in data and 'routes' in data['directions']:
+            routes = data['directions']['routes']
+            if len(routes) > 0 and 'legs' in routes[0]:
+                path = []
+                for leg in routes[0]['legs']:
+                    for step in leg.get('steps', []):
+                        if 'polyline' in step and 'points' in step['polyline']:
+                            pts = step['polyline']['points']
+                            path.extend(decode_polyline(pts))
+                if path:
+                    return path
+        logger.warning(f"No valid directions found in API for route {route_id}")
+    except Exception as e:
+        logger.error(f"Failed to fetch directions for route {route_id}: {e}")
+        
+    return []
+
+
+def _process_gps_packet(device_id: str, payload_str: str) -> None:
+    """Parse and ingest a raw GPS packet into the prediction adapter."""
+    data = json.loads(payload_str)
+    adapter.ingest_gps_packet(
+        device_id=device_id,
+        latitude=str(data.get("latitude", data.get("lat"))) if data.get("latitude", data.get("lat")) is not None else "0",
+        longitude=str(data.get("longitude", data.get("lon"))) if data.get("longitude", data.get("lon")) is not None else "0",
+        timestamp=int(data.get("timestamp", time.time() * 1000)),
+        speed=str(data["speed"]) if data.get("speed") is not None else None,
+    )
+
+
+def start_redis_daemon():
+    """Single-threaded daemon: ingests GPS, runs predictions, publishes at 1Hz."""
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    )
+    logger.info("Starting Redis Prediction Daemon (Single-Thread)...")
+
+    # Fetch route-device mappings from API -- let errors propagate
+    mappings = fetch_route_device_mappings()
+
+    if not mappings:
+        logger.warning("No active routes found.")
+
+    # Build device-route lookup and parse polylines per route
+    route_polylines: Dict[str, list] = {}
+
+    for route_id, info in mappings.items():
+        for device_id in info["devices"]:
+            device_to_route[device_id] = route_id
+
+        # Fetch route geometry from the new Directions API
+        logger.info(f"Fetching geometry for route {route_id}...")
+        polyline = fetch_route_geometry(route_id)
+        if polyline:
+            route_polylines[route_id] = polyline
+        else:
+            logger.warning(f"Failed to fetch proper directions polyline for route {route_id}")
+            route_polylines[route_id] = []
+
+    # --- FALLBACK LOGIC ---
+    # The user requested that ONLY the main route should be used for prediction.
+    # Therefore, we forcibly merge ALL vehicles from ALL routes into the master route.
+    functional_routes = {r_id: p for r_id, p in route_polylines.items() if len(p) > 0}
+    if functional_routes:
+        # Prefer 'testroute001' as the master route per user request, otherwise fallback to longest
+        if 'testroute001' in functional_routes:
+            master_route_id = 'testroute001'
+            master_polyline = functional_routes['testroute001']
+        else:
+            master_route_id, master_polyline = max(functional_routes.items(), key=lambda x: len(x[1]))
+            
+        for route_id, polyline in list(route_polylines.items()):
+            if route_id != master_route_id:
+                logger.info(f"Route '{route_id}' overridden. Moving its vehicles formally to master route '{master_route_id}'.")
+                
+                # Move all devices into the master route's dictionary
+                if route_id in mappings:
+                    broken_devices = mappings[route_id]["devices"]
+                    mappings[master_route_id]["devices"].update(broken_devices)
+                    
+                    # Update the device-to-route lookup so they consider the master route as their MAIN route
+                    for d in broken_devices:
+                        device_to_route[d] = master_route_id
+                    
+                    # Remove the overridden route entirely so it's no longer tracked independently
+                    del mappings[route_id]
+                
+                if route_id in route_polylines:
+                    del route_polylines[route_id]
+
+    logger.info("%d devices across %d routes", len(device_to_route), len(mappings))
+    for route_id, info in mappings.items():
+        logger.info("  Route '%s' -> %s (%d waypoints)",
+                     route_id, info['devices'], len(route_polylines[route_id]))
+
+    # Redis connections
+    r_sub = redis.Redis.from_url(REDIS_URL, decode_responses=True)
+    r_pub = redis.Redis.from_url(REDIS_URL, decode_responses=True)
+    print()
+
+    # Subscribe to each device channel
+    pubsub = r_sub.pubsub()
+    all_device_ids = list(device_to_route.keys())
+
+    if not all_device_ids:
+        logger.warning("No device channels to subscribe to.")
+        return
+
+    pubsub.subscribe(*all_device_ids)
+    logger.info("Subscribed to %d channels. Waiting for GPS...", len(all_device_ids))
+
+    # Tracking state
+    last_seen: Dict[str, float] = {}
+    polyline_pending: Set[str] = set(all_device_ids)
+    last_publish_time = time.time()
+
+    # --- Single-threaded event loop ---
+    while True:
+        # Poll for GPS messages (non-blocking, with short timeout)
+        message = pubsub.get_message(ignore_subscribe_messages=True, timeout=0.1)
+
+        if message and message["type"] == "message":
+            device_id = message["channel"]
+            payload = message["data"]
+            # print(payload,"Line Number 200")
+            route_id = device_to_route.get(device_id)
+            if route_id is None:
+                continue
+
+            # Ingest GPS packet
+            try:
+                _process_gps_packet(device_id, payload)
+            except Exception:
+                logger.exception("GPS processing failed for %s on route '%s'", device_id, route_id)
+                continue
+
+            last_seen[device_id] = time.time()
+
+            # Apply polyline after first GPS (predictor now exists)
+            if device_id in polyline_pending:
+                polyline = route_polylines.get(route_id, [])
+                if polyline:
+                    try:
+                        adapter.update_route_context(
+                            device_id=device_id,
+                            route_polyline=polyline,
+                            stops=None,
+                        )
+                        polyline_pending.discard(device_id)
+                        logger.info("Polyline applied for %s on route '%s'", device_id, route_id)
+                    except Exception:
+                        logger.exception("Failed to apply polyline for %s on route '%s'", device_id, route_id)
+
+        # --- Publish predictions every 1 second ---
+        now = time.time()
+        if now - last_publish_time >= 1.0:
+            last_publish_time = now
+
+            # Timeout inactive devices (120s)
+            expired = [d for d, ts in last_seen.items() if now - ts > 120]
+            for d in expired:
+                del last_seen[d]
+                adapter.remove_vehicle(d)
+                polyline_pending.add(d)
+                logger.warning("Device %s silent >120s, removing predictor.", d)
+
+            # Publish predictions for all active devices
+            for device_id in list(last_seen.keys()):
+                try:
+                    predicted_pos = adapter.get_display_position(device_id)
+                    if predicted_pos is not None:
+                        r_pub.publish(
+                            f"{TOPIC_PREDICTED_OUT}:{device_id}",
+                            json.dumps(predicted_pos),
+                        )
+                except Exception:
+                    logger.exception("Failed to predict/publish for device %s", device_id)

@@ -19,8 +19,14 @@ class PredictiveEngine:
     def set_enabled(self, enabled: bool) -> None:
         self._enabled = enabled
 
+    def remove_vehicle(self, vehicle_id: str) -> None:
+        """Delete the predictor for a vehicle so a fresh one is created on
+        the next GPS packet.  Used when a device goes silent for too long
+        and the accumulated state becomes stale."""
+        self._predictors.pop(vehicle_id, None)
+
     # -----------------------------
-    # GPS ingestion (UNCHANGED)
+    # GPS ingestion 
     # -----------------------------
 
     def ingest_gps(self, packet: GPSPacket) -> None:
@@ -38,7 +44,7 @@ class PredictiveEngine:
         predictor.ingest_gps(packet)
 
     # -----------------------------
-    # NEW: Route context management
+    # Route context management
     # -----------------------------
 
     def update_route_context(
@@ -57,7 +63,7 @@ class PredictiveEngine:
         predictor.update_route_context(route_polyline, stops)
 
     # -----------------------------
-    # UI output (UNCHANGED)
+    # UI output 
     # -----------------------------
 
     def get_display_position(
@@ -81,9 +87,10 @@ class PredictiveEngine:
             now_ts = time.time()
 
         # Predictor is the single source of truth
-        result = predictor.get_display_position(now_ts)
+        result = self._predictors[vehicle_id].get_display_position(now_ts)
         if result is None:
             return None
 
-        lat, lon, confidence, speed_mps = result
-        return lat, lon, confidence, speed_mps
+        # Return 5-tuple
+        lat, lon, confidence, speed_mps, is_off_route = result
+        return lat, lon, confidence, speed_mps, is_off_route

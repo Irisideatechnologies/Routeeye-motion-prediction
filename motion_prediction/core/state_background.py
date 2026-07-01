@@ -20,6 +20,7 @@ from motion_prediction.core.route_follower import RouteFollower
 
 @dataclass
 class BackgroundState:
+    device_id: str
     ref_lat: float
     ref_lon: float
 
@@ -41,6 +42,12 @@ class BackgroundState:
     # Route-following support
     route_follower: Optional['RouteFollower'] = None
 
+    # Off-route detection: skip route following if vehicle is far from route (e.g. parking).
+    _off_route: bool = False
+
+    # Bypass prediction entirely when vehicle is >120m from route.
+    _bypass_prediction: bool = False
+
    
     marker_position: Vec2 = None  # Current visual marker position
     marker_velocity: Vec2 = None  # Current visual marker velocity
@@ -50,9 +57,10 @@ class BackgroundState:
     
 
     @classmethod
-    def initialize_from_gps(cls, lat: float, lon: float, ts: float) -> "BackgroundState":
+    def initialize_from_gps(cls, lat: float, lon: float, ts: float, device_id: str = "") -> "BackgroundState":
         pos = Vec2.zero()
         return cls(
+            device_id=device_id,
             ref_lat=lat,
             ref_lon=lon,
             position=pos,
@@ -86,6 +94,81 @@ class BackgroundState:
         gps_pos = latlon_to_xy(lat, lon, self.ref_lat, self.ref_lon)
         dt = max(ts - self.last_gps_ts, 1e-3)
 
+        # --- OFF-ROUTE DETECTION (runs before all branches) ---
+        # Disable route following if vehicle >75m from route (tolerates ~35m noise).
+        OFF_ROUTE_THRESHOLD_M = 75.0
+        ON_ROUTE_THRESHOLD_M = 40.0  # Hysteresis: must come closer to re-engage
+        BYPASS_PREDICTION_THRESHOLD_M = 120.0  # Beyond this, bypass prediction entirely
+
+        if self.route_follower:
+            dist = self.route_follower.nearest_route_distance(gps_pos)
+
+            # --- Bypass prediction tier (>120m) ---
+            if dist > BYPASS_PREDICTION_THRESHOLD_M:
+                if not self._bypass_prediction:
+                    self._bypass_prediction = True
+                    self._off_route = True
+                    import logging
+                    logging.getLogger(__name__).info(
+                        "[%s] Vehicle VERY FAR from route (%.0fm). Bypassing prediction entirely.",
+                        self.device_id, dist
+                    )
+            # --- Normal off-route tier (75-120m) ---
+            elif not self._off_route and dist > OFF_ROUTE_THRESHOLD_M:
+                self._off_route = True
+                import logging
+                logging.getLogger(__name__).info(
+                    "[%s] Vehicle went OFF-ROUTE (%.0fm from polyline). Holding at GPS position.",
+                    self.device_id, dist
+                )
+            # --- Re-engage route (<40m) ---
+            elif self._off_route and dist < ON_ROUTE_THRESHOLD_M:
+                self._off_route = False
+                self._bypass_prediction = False
+                # Re-initialize route follower for clean handoff
+                self.route_follower._initialized = False
+                self.route_follower._direction_verified = False  # Allow auto-reverse check
+                import logging
+                logging.getLogger(__name__).info(
+                    "[%s] Vehicle returned ON-ROUTE (%.0fm from polyline). Resuming route following.",
+                    self.device_id, dist
+                )
+
+        # --- END-OF-ROUTE DETECTION ---
+        # Release to off-route mode immediately if vehicle reaches polyline end but keeps moving.
+        if (self.route_follower
+                and not self._off_route
+                and self.route_follower.at_route_end
+                and speed_mps is not None
+                and speed_mps > 1.0):  # 3.6 km/h — clearly still driving
+            self._off_route = True
+            import logging
+            logging.getLogger(__name__).info(
+                "[%s] Vehicle reached END OF ROUTE and still moving (%.1f m/s). "
+                "Switching to off-route mode.", self.device_id, speed_mps
+            )
+
+        # --- GPS SNAP TO ROUTE ---
+        # Project raw GPS within 50m onto nearest route segment to filter noise.
+        MAX_SNAP_DIST_M = 50.0
+        if self.route_follower and not self._off_route:
+            snapped_pos = self.route_follower.snap_to_route(gps_pos)
+            snap_dist = (snapped_pos - gps_pos).magnitude()
+            if snap_dist <= MAX_SNAP_DIST_M:
+                gps_pos = snapped_pos
+
+        # --- SPEED INFERENCE FROM POSITION DELTA ---
+        # Infer speed from position delta if GPS incorrectly reports 0 speed while moving.
+        position_delta_for_speed = (gps_pos - self.last_gps_position).magnitude()
+        if (speed_mps is not None
+                and speed_mps < 0.3
+                and dt > 2.0
+                and position_delta_for_speed > 5.0):
+            inferred_speed = position_delta_for_speed / dt
+            # Cap inferred speed at a reasonable max (100 km/h for bus)
+            inferred_speed = min(inferred_speed, 27.78)
+            speed_mps = inferred_speed
+
         # --- STOP ---
         if speed_mps is not None and speed_mps < 0.3:
             self.position = gps_pos
@@ -94,7 +177,7 @@ class BackgroundState:
             self.last_confirmed_speed_mps = 0.0
             self.confidence = 1.0
             self.dead_reckon_dist = 0.0
-            self.last_heading_dir = None
+            # Preserve last_heading_dir so vehicle can instantly resume moving.
             self.last_motion_state = "STOPPED"
             self.last_gps_ts = ts
             self.last_gps_position = gps_pos
@@ -131,6 +214,21 @@ class BackgroundState:
             delta = gps_pos - self.last_gps_position
             if delta.magnitude() > 0.5:
                 direction = delta.normalized()
+                
+                # --- AUTO-REVERSE ROUTE FOLLOWER IF MOVING BACKWARDS ---
+                if self.route_follower and not getattr(self.route_follower, '_direction_verified', False) and delta.magnitude() > 5.0:
+                    p1, seg1, prog1 = self.route_follower._global_locate(self.last_gps_position)
+                    p2, seg2, prog2 = self.route_follower._global_locate(gps_pos)
+                    
+                    dist1 = self.route_follower._route_dist_at(seg1, prog1)
+                    dist2 = self.route_follower._route_dist_at(seg2, prog2)
+                    
+                    if dist2 < dist1 - 2.0:
+                        import logging
+                        logging.getLogger(__name__).info("[%s] Auto-reversing route follower for inbound vehicle!", self.device_id)
+                        self.route_follower.reverse()
+                    
+                    self.route_follower._direction_verified = True
 
             # 2. Try current velocity direction
             elif self.velocity.magnitude() > 0.5:
@@ -180,6 +278,14 @@ class BackgroundState:
         time_since_gps = now_ts - self.last_gps_ts
         dead_reckoning = time_since_gps >= DEAD_RECKON_START_SEC
 
+        # --- Confidence decay (computed BEFORE velocity decisions) ---
+        if time_since_gps <= DEAD_RECKON_START_SEC:
+            self.confidence = 0.5 ** (time_since_gps / DEAD_RECKON_START_SEC)
+        else:
+            extra = time_since_gps - DEAD_RECKON_START_SEC
+            self.confidence = 0.5 * (CONFIDENCE_DECAY_PER_SEC ** extra)
+        self.confidence = max(0.0, min(1.0, self.confidence))
+
         # Integrate motion
         self.velocity = integrate_velocity(self.velocity, self.acceleration, dt)
 
@@ -196,38 +302,47 @@ class BackgroundState:
                 VELOCITY_DAMPING ** dt
             )
 
-        # --- Brake bias ---
-        if self.confidence < 0.43:
+        # --- Brake bias (only during dead reckoning) ---
+        if dead_reckoning and self.confidence < 0.43:
             self.velocity = apply_braking_bias(self.velocity, BRAKE_STRENGTH, dt)
+
+        # --- Velocity floor: snap to zero below 1 km/h (0.2778 m/s) ---
+        VELOCITY_FLOOR_MPS = 1.0 / 3.6  # 1 km/h
+        if self.velocity.magnitude() < VELOCITY_FLOOR_MPS:
+            self.velocity = Vec2.zero()
+            self.acceleration = Vec2.zero()
 
         # --- Hard stop ---
         if self.confidence <= DEAD_RECKON_STOP_CONF:
             self.velocity = Vec2.zero()
             self.acceleration = Vec2.zero()
-            self.last_heading_dir = None
+            # Deliberately NOT clearing self.last_heading_dir here so the 
+            # vehicle can resume moving instantly on the next GPS ping.
 
         speed_before_route = self.velocity.magnitude()
         
-        # ROUTE-FOLLOWING: ALWAYS ACTIVE WHEN ROUTE AVAILABLE
+        # ROUTE-FOLLOWING: active when route is available AND vehicle is on-route
         
 
-        if self.route_follower:
-            # ALWAYS use route-following to keep marker on visible route line
+        if self.route_follower and not self._off_route:
+            # Vehicle is on-route: use route-following to keep marker on polyline
             self.position, self.velocity = self.route_follower.advance_along_route(
                 current_position=self.position,
                 speed=self.velocity.magnitude(),
                 dt=dt,
                 confidence=self.confidence,
             )
+        elif self._off_route:
+            # Use dead reckoning for off-route vehicle to maintain smooth movement.
+            prev = self.position
+            self.position = integrate_position(self.position, self.velocity, dt)
+            self.dead_reckon_dist += (self.position - prev).magnitude()
+            
         else:
             # No route available - use normal physics-based position
             prev = self.position
             self.position = integrate_position(self.position, self.velocity, dt)
             self.dead_reckon_dist += (self.position - prev).magnitude()
-
-        if time_since_gps <= SPEED_HOLD_SEC and target_speed_mps > 0.1:
-            if self.velocity.magnitude() > 0.1:
-                self.velocity = self.velocity.normalized() * target_speed_mps
         
         # MARKER POSITION CALCULATION
         
@@ -243,12 +358,5 @@ class BackgroundState:
 
             self.marker_position += (self.position - self.marker_position) * alpha
             self.marker_velocity += (self.velocity - self.marker_velocity) * alpha
-        # --- Confidence decay  ---
-        if time_since_gps <= DEAD_RECKON_START_SEC:
-            self.confidence = 0.5 ** (time_since_gps / DEAD_RECKON_START_SEC)
-        else:
-            extra = time_since_gps - DEAD_RECKON_START_SEC
-            self.confidence = 0.5 * (CONFIDENCE_DECAY_PER_SEC ** extra)
 
-        self.confidence = max(0.0, min(1.0, self.confidence))
         self.last_update_ts = now_ts

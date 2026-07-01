@@ -25,7 +25,8 @@ class DisplaySample:
     gps_speed_cap: Optional[float] = None
     time_since_gps: float = 0.0
     marker_position: Optional[Vec2] = None  
-    marker_velocity: Optional[Vec2] = None 
+    marker_velocity: Optional[Vec2] = None
+    is_off_route: bool = False
 
 
 class DisplayState:
@@ -34,7 +35,7 @@ class DisplayState:
         self.ref_lat = ref_lat
         self.ref_lon = ref_lon
 
-        self._history: Deque[DisplaySample] = deque(maxlen=32)
+        self._history: Deque[DisplaySample] = deque(maxlen=64)
 
         self._display_position: Optional[Vec2] = None
         self._display_velocity: Vec2 = Vec2.zero()
@@ -43,10 +44,11 @@ class DisplayState:
         # Magnetic well for bus stops
         self._magnetic_well = MagneticWell()
 
-    
-    # Bus stop management 
-    
+        # Shared route follower (owned by BackgroundState, read-only here)
+        self._route_follower = None
+        self._display_route_dist: Optional[float] = None
 
+    
     def set_bus_stops(self, stops: List) -> None:
 
         from motion_prediction.core.magnetic_well import BusStop as MagneticBusStop
@@ -60,6 +62,9 @@ class DisplayState:
 
         self._magnetic_well.set_stops(magnetic_stops)
 
+    def set_route_follower(self, follower) -> None:
+        self._route_follower = follower
+
     
     # Background sampling 
     
@@ -72,8 +77,9 @@ class DisplayState:
             confidence: float,
             gps_speed_cap: Optional[float] = None,
             time_since_gps: float = 0.0,
-            marker_position: Optional[Vec2] = None,  # NEW
-            marker_velocity: Optional[Vec2] = None,  # NEW
+            marker_position: Optional[Vec2] = None,
+            marker_velocity: Optional[Vec2] = None,
+            is_off_route: bool = False,
     ) -> None:
 
         self._history.append(
@@ -84,8 +90,9 @@ class DisplayState:
                 confidence=confidence,
                 gps_speed_cap=gps_speed_cap,
                 time_since_gps=time_since_gps,
-                marker_position=marker_position,  # NEW
-                marker_velocity=marker_velocity,  # NEW
+                marker_position=marker_position,
+                marker_velocity=marker_velocity,
+                is_off_route=is_off_route,
             )
         )
 
@@ -109,6 +116,11 @@ class DisplayState:
             self._display_position = sample.position
             self._display_velocity = sample.velocity
             self._last_display_ts = now_ts
+            
+            if self._route_follower:
+                # Clamp initial position to route (read-only, doesn't mutate cursor)
+                self._display_position = self._route_follower.clamp_to_route(self._display_position)
+                self._display_route_dist = self._route_follower.route_distance_of(self._display_position)
 
         dt = max(now_ts - (self._last_display_ts or now_ts), 1e-3)
 
@@ -150,6 +162,46 @@ class DisplayState:
                 if final_speed > 1e-3:
                     self._display_velocity = self._display_velocity.normalized() * sample.gps_speed_cap
 
+        # # --- OFF-ROUTE HANDLING ---
+        # # When the vehicle is off-route (depot, parking, wrong route), bypass
+        # # prediction entirely and show the raw GPS position directly.
+        # # The marker will update each time a new GPS packet arrives (~10-15s).
+        # # When the vehicle returns on-route, prediction resumes seamlessly
+        # # because _display_position is already near the vehicle's actual location.
+        # if sample.is_off_route:
+        #     # Jump display position to the latest raw GPS position (no prediction)
+        #     self._display_position = sample.position
+        #     self._display_velocity = Vec2.zero()
+        #     self._last_display_ts = now_ts
+
+        #     lat, lon = xy_to_latlon(
+        #         self._display_position,
+        #         self.ref_lat,
+        #         self.ref_lon,
+        #     )
+        #     # Pass through the actual GPS speed so the marker doesn't report 0
+        #     speed_mps = sample.gps_speed_cap if sample.gps_speed_cap is not None else 0.0
+        #     return lat, lon, sample.confidence, speed_mps, sample.is_off_route
+
+        # --- OFF-ROUTE HANDLING ---
+        # Bypass prediction and show raw GPS when vehicle is off-route.
+        if sample.is_off_route:
+            # Jump display position to the latest raw GPS position (no prediction)
+            self._display_position = sample.position
+            self._display_velocity = Vec2.zero()
+            self._last_display_ts = now_ts
+            # Reset cached route distance so re-engagement starts fresh
+            self._display_route_dist = None
+
+            lat, lon = xy_to_latlon(
+                self._display_position,
+                self.ref_lat,
+                self.ref_lon,
+            )
+            # Pass through the actual GPS speed so the marker doesn't report 0
+            speed_mps = sample.gps_speed_cap if sample.gps_speed_cap is not None else 0.0
+            return lat, lon, sample.confidence, speed_mps, sample.is_off_route
+
         # --- Proposed forward motion ---
         proposed_pos = self._display_position + self._display_velocity * dt
 
@@ -164,9 +216,13 @@ class DisplayState:
         error_vec = sample.position - proposed_pos
         dist_to_sample = error_vec.magnitude()
 
-        if dist_to_sample > 0.1:
-           
-            catchup_speed = min(dist_to_sample * 0.5, 8.0)
+        if dist_to_sample > 500.0:
+            # Massive jump (e.g. depot start / route reassignment)
+            # Instantly snap display marker
+            proposed_pos = sample.position
+        elif dist_to_sample > 0.1:
+            # Proportional catch-up: faster when further behind
+            catchup_speed = min(dist_to_sample * 1.0, 15.0)
             catchup_dist = catchup_speed * dt
             
             if catchup_dist > dist_to_sample:
@@ -175,7 +231,6 @@ class DisplayState:
             proposed_pos += error_vec.normalized() * catchup_dist
 
         # MAGNETIC WELL — applied to DISPLAY position
-
         well_check_velocity = sample.marker_velocity if sample.marker_velocity else self._display_velocity
 
         proposed_pos, self._display_velocity = self._magnetic_well.apply_well(
@@ -183,6 +238,41 @@ class DisplayState:
             velocity=well_check_velocity,  
             gps_speed_mps=sample.gps_speed_cap,
         )
+
+        # --- STRICT ROUTE CLAMPING ---
+        # Clamp proposed position to route polyline and ensure strict monotonic forward progress.
+        if self._route_follower:
+            # Check if the physics engine auto-reversed the route beneath us
+            current_rev_count = getattr(self._route_follower, 'reverse_count', 0)
+            if current_rev_count != getattr(self, '_last_reverse_count', 0):
+                self._display_route_dist = None
+                self._last_reverse_count = current_rev_count
+
+            # 1. Use global search if display is far behind to find correct position on route.
+            use_hint = self._display_route_dist if dist_to_sample <= 50.0 else None
+            new_dist = self._route_follower.route_distance_of(proposed_pos, hint_dist=use_hint)
+            
+            # 2. Enforce forward-only constraint (with safety valve)
+            if self._display_route_dist is not None:
+                if dist_to_sample > 500.0:
+                    # Massive jump (depot start / reassignment) - allow backward jump
+                    self._display_route_dist = new_dist
+                elif dist_to_sample > 15.0 and sample.gps_speed_cap is not None and sample.gps_speed_cap > 1.0:
+                    # Unstick display if it falls >15m behind a moving vehicle.
+                    self._display_route_dist = new_dist
+                else:
+                    # Allow up to 2m backward slip to handle curve tangent projections
+                    self._display_route_dist = max(self._display_route_dist - 2.0, new_dist)
+            else:
+                self._display_route_dist = new_dist
+                
+            # 3. Extract exact 2D position at the constrained route distance
+            proposed_pos, route_dir = self._route_follower.position_at_distance(self._display_route_dist)
+
+            # 4. Align display velocity to route direction to prevent freezing on sharp curves.
+            speed = self._display_velocity.magnitude()
+            if speed > 0.1:
+                self._display_velocity = route_dir * speed
 
         # --- Commit ---
         self._display_position = proposed_pos
@@ -194,9 +284,14 @@ class DisplayState:
             self.ref_lon,
         )
 
-        speed_mps = self._display_velocity.magnitude()
+        # Velocity floor: snap to zero below 1 km/h (matches background state floor)
+        VELOCITY_FLOOR_MPS = 1.0 / 3.6  # 1 km/h
+        if self._display_velocity.magnitude() < VELOCITY_FLOOR_MPS:
+            speed_mps = 0.0
+        else:
+            speed_mps = self._display_velocity.magnitude()
 
-        return lat, lon, sample.confidence, speed_mps
+        return lat, lon, sample.confidence, speed_mps, sample.is_off_route
 
     # Internal helpers 
     
@@ -206,8 +301,19 @@ class DisplayState:
             target_ts: float,
     ) -> Optional[DisplaySample]:
 
-        if len(self._history) < 2:
+        if not self._history:
             return None
+            
+        if len(self._history) == 1:
+            return self._history[0]
+
+        # If target is older than our oldest history, return the oldest
+        if target_ts <= self._history[0].ts:
+            return self._history[0]
+
+        # If target is newer than our newest history, return the newest
+        if target_ts >= self._history[-1].ts:
+            return self._history[-1]
 
         for i in range(len(self._history) - 1):
             a = self._history[i]
@@ -232,7 +338,8 @@ class DisplayState:
 
                 return DisplaySample(
                     target_ts, pos, vel, conf, gps_cap, time_since,
-                    marker_pos, marker_vel  # NEW
+                    marker_pos, marker_vel,
+                    is_off_route=b.is_off_route,
                 )
 
-        return None
+        return self._history[-1]

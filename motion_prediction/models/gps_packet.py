@@ -12,9 +12,9 @@ class GPSPacket:
     timestamp: float
     speed_mps: Optional[float] = None
 
-    # -----------------------------
+    
     # Validation helpers
-    # -----------------------------
+    
 
     def is_valid(self) -> bool:
 
