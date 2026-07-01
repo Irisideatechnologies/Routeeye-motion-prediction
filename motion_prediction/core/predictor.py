@@ -17,6 +17,7 @@ class VehiclePredictor:
             lat=first_packet.lat,
             lon=first_packet.lon,
             ts=first_packet.timestamp,
+            device_id=first_packet.vehicle_id,
         )
 
         # 🔑 Seed speed immediately
@@ -89,9 +90,13 @@ class VehiclePredictor:
             ref_lon=self._ref_lon,
         )
 
-        # Set route follower for background state
+        # Single route follower shared between background and display.
+        # Background is the authority — it advances the cursor via
+        # advance_along_route() and snap_to_route().
+        # Display uses clamp_to_route() which is read-only (no cursor mutation).
         route_follower = RouteFollower(route)
         self._bg.set_route_follower(route_follower)
+        self._display.set_route_follower(route_follower)  # same instance
 
         # Set bus stops for display state (magnetic wells)
         self._display.set_bus_stops(route.stops)
@@ -129,20 +134,21 @@ class VehiclePredictor:
                 gps_speed_cap=self._bg.last_confirmed_speed_mps,
                 time_since_gps=time_since_gps,
                 marker_position=self._bg.marker_position,  
-                marker_velocity=self._bg.marker_velocity,  
+                marker_velocity=self._bg.marker_velocity,
+                is_off_route=self._bg._off_route or self._bg._bypass_prediction,
             )
 
     # -----------------------------
     # Display position 
     # -----------------------------
 
-    def get_display_position(self, now_ts: float) -> Optional[tuple[float, float, float, float]]:
+    def get_display_position(self, now_ts: float) -> Optional[tuple[float, float, float, float, bool]]:
         self.tick(now_ts)
 
         result = self._display.get_display_position(now_ts)
         if result is None:
             return None
 
-        lat, lon, confidence, speed_mps = result
+        lat, lon, confidence, speed_mps, is_off_route = result
 
-        return lat, lon, confidence, speed_mps
+        return lat, lon, confidence, speed_mps, is_off_route

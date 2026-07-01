@@ -33,10 +33,14 @@ class MagneticWell:
         self._stops: List[BusStop] = []
         self._approach_state: Optional[StopApproachState] = None
         self._is_stopped: bool = False
+        self._passed_stops: set = set()  # Stop IDs the vehicle has already visited/passed
 
     def set_stops(self, stops: List[BusStop]) -> None:
         """Update the list of bus stops for this route"""
         self._stops = stops
+        self._passed_stops.clear()  # Reset on route change
+        self._approach_state = None
+        self._is_stopped = False
 
     def apply_well(
             self,
@@ -49,7 +53,16 @@ class MagneticWell:
         # --- Check for departure from stopped state ---
         if self._is_stopped:
             if gps_speed_mps is not None and gps_speed_mps > 0.8:  # 2.88 km/h (lower for 25 km/h max)
-                # Bus is moving again - release from stop
+                # Bus is moving again - mark this stop as passed so we don't snap back
+                if self._approach_state and self._approach_state.stop:
+                    self._passed_stops.add(self._approach_state.stop.stop_id)
+                    # Terminal stop (first or last) = end of trip.
+                    # Reset so all stops are available for the return trip.
+                    if self._stops and (
+                        self._approach_state.stop.stop_id == self._stops[0].stop_id
+                        or self._approach_state.stop.stop_id == self._stops[-1].stop_id
+                    ):
+                        self._passed_stops.clear()
                 self._is_stopped = False
                 self._approach_state = None
                 return position, velocity
@@ -145,14 +158,24 @@ class MagneticWell:
 
         # Movement direction
         if velocity.magnitude() < 0.1:
-            # Not moving - just find nearest
-            return self._find_nearest_stop(position)
+            # Not moving — only consider the stop we're already approaching.
+            # Do NOT search for the nearest stop in all directions, because
+            # that can pull the marker backward to an already-passed stop.
+            if self._approach_state and self._approach_state.stop:
+                stop = self._approach_state.stop
+                if stop.stop_id not in self._passed_stops:
+                    distance = (stop.position - position).magnitude()
+                    return (stop, distance)
+            return None
 
         direction = velocity.normalized()
 
-        # Find stops that are ahead of us
+        # Find stops that are ahead of us AND not already passed
         candidates = []
         for stop in self._stops:
+            if stop.stop_id in self._passed_stops:
+                continue  # Skip already-visited stops
+
             to_stop = stop.position - position
             distance = to_stop.magnitude()
 

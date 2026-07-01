@@ -89,8 +89,6 @@ def decode_polyline(polyline_str: str) -> list:
 
 def fetch_route_geometry(route_id: str) -> list:
     """Fetch and decode the route polyline from the Directions API."""
-    if route_id.lower() != "route8h":
-        return []
         
     url = API_DIRECTIONS_BASE_URL.replace("{route_id}", route_id)
     headers = {"Authorization": f"Bearer {API_BEARER_TOKEN}"}
@@ -159,6 +157,37 @@ def start_redis_daemon():
         else:
             logger.warning(f"Failed to fetch proper directions polyline for route {route_id}")
             route_polylines[route_id] = []
+
+    # --- FALLBACK LOGIC ---
+    # The user requested that ONLY the main route should be used for prediction.
+    # Therefore, we forcibly merge ALL vehicles from ALL routes into the master route.
+    functional_routes = {r_id: p for r_id, p in route_polylines.items() if len(p) > 0}
+    if functional_routes:
+        # Prefer 'testroute001' as the master route per user request, otherwise fallback to longest
+        if 'testroute001' in functional_routes:
+            master_route_id = 'testroute001'
+            master_polyline = functional_routes['testroute001']
+        else:
+            master_route_id, master_polyline = max(functional_routes.items(), key=lambda x: len(x[1]))
+            
+        for route_id, polyline in list(route_polylines.items()):
+            if route_id != master_route_id:
+                logger.info(f"Route '{route_id}' overridden. Moving its vehicles formally to master route '{master_route_id}'.")
+                
+                # Move all devices into the master route's dictionary
+                if route_id in mappings:
+                    broken_devices = mappings[route_id]["devices"]
+                    mappings[master_route_id]["devices"].update(broken_devices)
+                    
+                    # Update the device-to-route lookup so they consider the master route as their MAIN route
+                    for d in broken_devices:
+                        device_to_route[d] = master_route_id
+                    
+                    # Remove the overridden route entirely so it's no longer tracked independently
+                    del mappings[route_id]
+                
+                if route_id in route_polylines:
+                    del route_polylines[route_id]
 
     logger.info("%d devices across %d routes", len(device_to_route), len(mappings))
     for route_id, info in mappings.items():
@@ -232,8 +261,9 @@ def start_redis_daemon():
             expired = [d for d, ts in last_seen.items() if now - ts > 120]
             for d in expired:
                 del last_seen[d]
-                polyline_pending.discard(d)
-                logger.warning("Device %s silent >120s, removing.", d)
+                adapter.remove_vehicle(d)
+                polyline_pending.add(d)
+                logger.warning("Device %s silent >120s, removing predictor.", d)
 
             # Publish predictions for all active devices
             for device_id in list(last_seen.keys()):
