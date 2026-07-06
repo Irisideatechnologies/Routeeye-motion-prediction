@@ -6,9 +6,6 @@ import time
 from motion_prediction.core.kalman_engine import KalmanEngine
 from motion_prediction.models.gps_packet import GPSPacket
 
-# GPS speed below this (km/h) is treated as stopped
-SPEED_STOP_THRESHOLD_KMPH = 4.0
-
 
 class MotionPredictionAdapter:
 
@@ -40,10 +37,10 @@ class MotionPredictionAdapter:
             speed_mps = None
             if speed is not None:
                 speed_kmph = float(speed)
-                if speed_kmph < SPEED_STOP_THRESHOLD_KMPH:
-                    speed_mps = 0.0
-                else:
+                if speed_kmph > 0.0:
                     speed_mps = speed_kmph / 3.6
+                else:
+                    speed_mps = 0.0
 
         except (ValueError, TypeError):
             return

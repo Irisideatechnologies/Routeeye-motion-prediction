@@ -15,7 +15,8 @@ class KalmanTuning:
     meas_speed_var: float = 2.25         # (m/s)² — ~1.5 m/s speed std
     init_pos_var: float = 16.0           # m²
     init_speed_var: float = 4.0          # (m/s)²
-    innovation_reset_m: float = 80.0     # reset filter if innovation exceeds this
+    innovation_reset_m: float = 80.0     # hard reset if forward innovation exceeds this
+    max_backward_innovation_m: float = 20.0  # clamp backward GPS snaps per update
 
 
 class RouteKalmanFilter:
@@ -68,15 +69,21 @@ class RouteKalmanFilter:
         return self._update(np.array([s_meas, v_meas]), H, R)
 
     def _update(self, z: np.ndarray, H: np.ndarray, R: np.ndarray) -> bool:
+        z = np.array(z, dtype=float, copy=True)
         innovation = z - H @ self.x
         S = H @ self.P @ H.T + R
 
-        # Reject implausible jumps (bad GPS / teleport)
+        # Large GPS corrections: soften backward snaps, hard-reset only on forward teleports.
         if self.initialized and innovation.size >= 1:
             innov_s = float(innovation[0])
             sigma = math.sqrt(max(float(S[0, 0]), 1e-6))
             gate = max(self._tuning.innovation_reset_m, 3.0 * sigma)
-            if abs(innov_s) > gate:
+            if innov_s < -self._tuning.max_backward_innovation_m:
+                # GPS behind dead-reckoned position — clamp, do not jump backward.
+                z[0] = max(float(z[0]), self.s - self._tuning.max_backward_innovation_m)
+                innovation = z - H @ self.x
+            elif innov_s > gate:
+                # Large forward teleport — re-initialize to GPS.
                 self.initialize(float(z[0]), float(z[1]) if z.size > 1 else max(0.0, self.v))
                 return False
 
@@ -86,6 +93,18 @@ class RouteKalmanFilter:
         self.P = (I - K @ H) @ self.P
         self.initialized = True
         return True
+
+    def clamp_s(self, max_s: float) -> None:
+        """Cap arc-length (e.g. dead-reckoning limit between GPS fixes)."""
+        self.x[0] = min(self.s, max(0.0, max_s))
+
+    def clamp_v(self, max_v: float) -> None:
+        """Cap speed (e.g. decay when GPS is stale)."""
+        self.x[1] = min(self.v, max(0.0, max_v))
+
+    def ensure_min_v(self, min_v: float) -> None:
+        """Floor speed after GPS fusion when device reports movement."""
+        self.x[1] = max(self.v, max(0.0, min_v))
 
     def _clamp_state(self, max_route_dist: float | None) -> None:
         self.x[0] = max(0.0, self.x[0])
