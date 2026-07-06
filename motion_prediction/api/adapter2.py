@@ -85,8 +85,8 @@ class MotionPredictionAdapter:
 
         return {
             "device_id": vehicle_id,
-            "latitude": str(lat),
-            "longitude": str(lon),
+            "latitude": f"{lat:.7f}",
+            "longitude": f"{lon:.7f}",
             "speed": str(round(speed_kmph, 2)),
             "timestamp": int(now_ts * 1000),
             "confidence": confidence,

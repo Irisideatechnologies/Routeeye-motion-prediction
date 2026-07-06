@@ -104,4 +104,5 @@ class RouteKalmanFilter:
     def confidence(self) -> float:
         """Map position variance to a 0–1 confidence score."""
         sigma_s = math.sqrt(max(float(self.P[0, 0]), 1e-6))
-        return max(0.0, min(1.0, 1.0 / (1.0 + sigma_s / 15.0)))
+        # Floor keeps predictions usable between sparse GPS updates (10–15 s).
+        return max(0.25, min(1.0, 1.0 / (1.0 + sigma_s / 20.0)))
