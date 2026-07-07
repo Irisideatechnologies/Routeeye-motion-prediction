@@ -15,6 +15,7 @@ from motion_prediction.config.env_loader import (
     API_BEARER_TOKEN,
     TOPIC_PREDICTED_OUT,
 )
+from motion_prediction.utils.route_polyline import get_route_polyline
 
 logger = logging.getLogger(__name__)
 
@@ -142,52 +143,20 @@ def start_redis_daemon():
     if not mappings:
         logger.warning("No active routes found.")
 
-    # Build device-route lookup and parse polylines per route
+    # Build device-route lookup and polylines per route (from routeCoordinates)
     route_polylines: Dict[str, list] = {}
 
     for route_id, info in mappings.items():
         for device_id in info["devices"]:
             device_to_route[device_id] = route_id
 
-        # Fetch route geometry from the new Directions API
-        logger.info(f"Fetching geometry for route {route_id}...")
-        polyline = fetch_route_geometry(route_id)
-        if polyline:
-            route_polylines[route_id] = polyline
-        else:
-            logger.warning(f"Failed to fetch proper directions polyline for route {route_id}")
-            route_polylines[route_id] = []
-
-    # --- FALLBACK LOGIC ---
-    # The user requested that ONLY the main route should be used for prediction.
-    # Therefore, we forcibly merge ALL vehicles from ALL routes into the master route.
-    functional_routes = {r_id: p for r_id, p in route_polylines.items() if len(p) > 0}
-    if functional_routes:
-        # Prefer 'testroute001' as the master route per user request, otherwise fallback to longest
-        if 'testroute001' in functional_routes:
-            master_route_id = 'testroute001'
-            master_polyline = functional_routes['testroute001']
-        else:
-            master_route_id, master_polyline = max(functional_routes.items(), key=lambda x: len(x[1]))
-            
-        for route_id, polyline in list(route_polylines.items()):
-            if route_id != master_route_id:
-                logger.info(f"Route '{route_id}' overridden. Moving its vehicles formally to master route '{master_route_id}'.")
-                
-                # Move all devices into the master route's dictionary
-                if route_id in mappings:
-                    broken_devices = mappings[route_id]["devices"]
-                    mappings[master_route_id]["devices"].update(broken_devices)
-                    
-                    # Update the device-to-route lookup so they consider the master route as their MAIN route
-                    for d in broken_devices:
-                        device_to_route[d] = master_route_id
-                    
-                    # Remove the overridden route entirely so it's no longer tracked independently
-                    del mappings[route_id]
-                
-                if route_id in route_polylines:
-                    del route_polylines[route_id]
+        polyline = get_route_polyline(
+            route_id,
+            info["route_data"],
+            directions_base_url=API_DIRECTIONS_BASE_URL,
+            fetch_directions_fn=fetch_route_geometry if API_DIRECTIONS_BASE_URL else None,
+        )
+        route_polylines[route_id] = polyline if polyline else []
 
     logger.info("%d devices across %d routes", len(device_to_route), len(mappings))
     for route_id, info in mappings.items():
